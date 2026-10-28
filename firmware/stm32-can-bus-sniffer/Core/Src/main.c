@@ -27,12 +27,17 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
+typedef struct {
+  uint32_t id;
+  uint8_t  dlc;
+  uint8_t  data[8];
+} can_msg_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define TEMP_CAN_ID  0x100U
+#define RXQ_SIZE     16U      // Number of frames in the software receive queue
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -43,22 +48,56 @@
 /* Private variables ---------------------------------------------------------*/
 CAN_HandleTypeDef hcan1;
 
-/* USER CODE BEGIN PV */
+UART_HandleTypeDef huart2;
 
+/* USER CODE BEGIN PV */
+static can_msg_t rxq[RXQ_SIZE];                       // Ring buffer filled in the ISR
+static volatile uint8_t  rxq_head = 0, rxq_tail = 0;  // head: written by ISR, tail: read by main loop
+static volatile uint32_t rxq_dropped = 0;             // Frames lost because the queue was full
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_CAN1_Init(void);
+static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
-static void CAN1_FilterAndStart(void);
-static int CAN1_LoopbackTest(void);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/**
+  * @brief  printf() retargeting: send every character over USART2.
+  *         '\n' is converted to "\r\n" so terminals display lines correctly.
+  */
+int __io_putchar(int ch)
+{
+    if (ch == '\n')
+    {
+        uint8_t ch2 = '\r';
+        HAL_UART_Transmit(&huart2, &ch2, 1, HAL_MAX_DELAY);
+    }
+    HAL_UART_Transmit(&huart2, (uint8_t*) &ch, 1, HAL_MAX_DELAY);
+    return 1;
+}
 
+/**
+  * @brief  Accept-all receive filter (filter bank 0, FIFO0).
+  *         Later this can be restricted to selected IDs.
+  */
+static void CAN_FilterConfig(void)
+{
+  CAN_FilterTypeDef f = {0};
+  f.FilterBank           = 0;
+  f.FilterMode           = CAN_FILTERMODE_IDMASK;
+  f.FilterScale          = CAN_FILTERSCALE_32BIT;
+  f.FilterMaskIdHigh     = 0x0000;      // mask = 0 -> accept all IDs
+  f.FilterMaskIdLow      = 0x0000;
+  f.FilterFIFOAssignment = CAN_RX_FIFO0;
+  f.FilterActivation     = ENABLE;
+  if (HAL_CAN_ConfigFilter(&hcan1, &f) != HAL_OK) Error_Handler();
+}
 /* USER CODE END 0 */
 
 /**
@@ -91,9 +130,17 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_CAN1_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  CAN1_FilterAndStart();
+  setvbuf(stdout, NULL, _IONBF, 0);     // unbuffered printf (output appears immediately)
+  CAN_FilterConfig();
+  if (HAL_CAN_Start(&hcan1) != HAL_OK) Error_Handler();
 
+  // Interrupt on every message pending in FIFO0
+  if (HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING) != HAL_OK) Error_Handler();
+
+  printf("L476 CAN receiver ready\n");
+  uint32_t last_rx = HAL_GetTick();     // timestamp of the last received frame
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -104,12 +151,30 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  int r = CAN1_LoopbackTest();
-	   if (r == 0) {
-	       HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-	   }
-	   HAL_Delay(500);
-  }
+	  // Process one queued frame per loop iteration (printing is done outside the ISR)
+	  if (rxq_tail != rxq_head) {
+	    can_msg_t m = rxq[rxq_tail];
+	    rxq_tail = (rxq_tail + 1U) % RXQ_SIZE;
+	    last_rx = HAL_GetTick();
+
+	    if (m.id == TEMP_CAN_ID && m.dlc == 3) {
+	      // Bytes 0..1: temperature in 0.1 degC, little-endian, signed
+	      int16_t t = (int16_t)((uint16_t)m.data[0] | ((uint16_t)m.data[1] << 8));
+	      int16_t a = (t < 0) ? -t : t;     // absolute value for printing without float
+	      printf("ID=0x%03lX T=%s%d.%d C CNT=%u\n",
+	             (unsigned long)m.id, (t < 0) ? "-" : "", a / 10, a % 10, m.data[2]);
+	    } else {
+	      // Any other frame: just report ID and length
+	      printf("ID=0x%03lX DLC=%u\n", (unsigned long)m.id, m.dlc);
+	    }
+	  }
+
+	  // Watchdog-like message when nothing was received for 3 seconds
+	  if (HAL_GetTick() - last_rx > 3000) {
+	    printf("no frames for 3 s (dropped=%lu)\n", (unsigned long)rxq_dropped);
+	    last_rx = HAL_GetTick();
+	  }
+	  }
   /* USER CODE END 3 */
 }
 
@@ -179,11 +244,11 @@ static void MX_CAN1_Init(void)
 
   /* USER CODE END CAN1_Init 1 */
   hcan1.Instance = CAN1;
-  hcan1.Init.Prescaler = 16;
-  hcan1.Init.Mode = CAN_MODE_LOOPBACK;
+  hcan1.Init.Prescaler = 10;
+  hcan1.Init.Mode = CAN_MODE_NORMAL;
   hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
-  hcan1.Init.TimeSeg1 = CAN_BS1_5TQ;
-  hcan1.Init.TimeSeg2 = CAN_BS2_4TQ;
+  hcan1.Init.TimeSeg1 = CAN_BS1_13TQ;
+  hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
   hcan1.Init.TimeTriggeredMode = DISABLE;
   hcan1.Init.AutoBusOff = DISABLE;
   hcan1.Init.AutoWakeUp = DISABLE;
@@ -197,6 +262,41 @@ static void MX_CAN1_Init(void)
   /* USER CODE BEGIN CAN1_Init 2 */
 
   /* USER CODE END CAN1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
 
 }
 
@@ -231,50 +331,28 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-static void CAN1_FilterAndStart(void)
+/**
+  * @brief  Rx FIFO0 message pending callback (called from the CAN RX0 interrupt).
+  *         Copies all pending frames to the software queue; no printing here,
+  *         because UART output is blocking and would slow down the ISR.
+  */
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
-    CAN_FilterTypeDef f = {0};
-    f.FilterBank = 0;
-    f.FilterMode = CAN_FILTERMODE_IDMASK;
-    f.FilterScale = CAN_FILTERSCALE_32BIT;
-    f.FilterIdHigh = 0x0000;
-    f.FilterIdLow = 0x0000;
-    f.FilterMaskIdHigh = 0x0000;               // maska 0 = przepuszcza wszystko
-    f.FilterMaskIdLow = 0x0000;
-    f.FilterFIFOAssignment = CAN_RX_FIFO0;
-    f.FilterActivation = ENABLE;
-    if (HAL_CAN_ConfigFilter(&hcan1, &f) != HAL_OK) Error_Handler();
+  CAN_RxHeaderTypeDef hdr;
+  uint8_t d[8];
 
-    if (HAL_CAN_Start(&hcan1) != HAL_OK) Error_Handler();
-}
+  while (HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO0) > 0) {
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &hdr, d) != HAL_OK) break;
 
-static int CAN1_LoopbackTest(void)
-{
-    CAN_TxHeaderTypeDef txh = {0};
-    CAN_RxHeaderTypeDef rxh;
-    uint8_t txd[8] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04};
-    uint8_t rxd[8] = {0};
-    uint32_t mailbox;
+    uint8_t next = (rxq_head + 1U) % RXQ_SIZE;
+    if (next == rxq_tail) { rxq_dropped++; continue; }   // queue full: drop the frame
 
-    txh.StdId = 0x123;
-    txh.IDE = CAN_ID_STD;
-    txh.RTR = CAN_RTR_DATA;
-    txh.DLC = 8;
-    txh.TransmitGlobalTime = DISABLE;
-
-    if (HAL_CAN_AddTxMessage(&hcan1, &txh, txd, &mailbox) != HAL_OK) return -1;
-
-    // czekaj na odebranie w FIFO0 (timeout ~100 ms)
-    uint32_t t0 = HAL_GetTick();
-    while (HAL_CAN_GetRxFifoFillLevel(&hcan1, CAN_RX_FIFO0) == 0) {
-        if (HAL_GetTick() - t0 > 100) return -2;
-    }
-
-    if (HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0, &rxh, rxd) != HAL_OK) return -3;
-
-    if (rxh.StdId != 0x123 || rxh.DLC != 8 || memcmp(txd, rxd, 8) != 0) return -4;
-
-    return 0;
+    can_msg_t *m = &rxq[rxq_head];
+    m->id  = (hdr.IDE == CAN_ID_STD) ? hdr.StdId : hdr.ExtId;
+    m->dlc = (uint8_t)hdr.DLC;
+    for (uint8_t i = 0; i < 8; i++) m->data[i] = d[i];
+    rxq_head = next;                                     // publish the frame to the main loop
+  }
 }
 /* USER CODE END 4 */
 
