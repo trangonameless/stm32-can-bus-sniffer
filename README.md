@@ -13,7 +13,7 @@
 ## Status
 - [x] CAN1 loopback test
 - [x] F103 temperature node -> L476 receiver -> UART
-- [ ] Listen-only (silent) mode
+- [x] Sniffer with candump -L output
 - [ ] SLCAN over USB CDC
 ## Hardware
 - STM32L476RG 
@@ -30,3 +30,7 @@
 ![CAN normal mode: internal temperature transmission](images/can_normal_mode_internal_temperature_transmission.png)
 
 *Logic 2 capture of the CAN bus in normal mode (500 kbit/s) while the F103 transmits its internal temperature.*
+
+### Frame reception in Ubuntu with candump -L format
+![Frame reception in UBUNTU](images/frame_reception_via_CAN_sniffer_with_candump_on_ubuntu.png)
+
